@@ -182,6 +182,15 @@ namespace BTD6API
             BroadcastEvent("defeat");
             base.OnDefeat();
         }
+        [HarmonyPatch(typeof(UnityToSimulation), nameof(UnityToSimulation.Restart))]
+        public class RestartPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix()
+            {
+                BroadcastEvent("restart");
+            }
+        }
         [HarmonyPatch(typeof(Tower), nameof(Tower.Initialise))]
         public class TowerPlacedPatch
         {
@@ -262,7 +271,6 @@ namespace BTD6API
             {
                 _pendingRestart = false;
                 InGame.instance.bridge.Restart();
-                BroadcastEvent("restart");
             }
             base.OnUpdate();
         }

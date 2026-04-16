@@ -1,5 +1,5 @@
 <h1 align="center">
-<a href="https://github.com/doombubbles/template-mod/releases/latest/download/BTD6API.dll">
+<a href="https://github.com/askryne/btd6-http-api/releases/latest/download/BTD6API.dll">
     <img align="left" alt="Icon" height="90" src="Icon.png">
     <img align="right" alt="Download" height="75" src="https://raw.githubusercontent.com/gurrenm3/BTD-Mod-Helper/master/BloonsTD6%20Mod%20Helper/Resources/DownloadBtn.png">
 </a>
@@ -16,6 +16,7 @@ The server will launch automatically when you start the game.
 
 ## Quick example
 
+Python:
 ```python
 >>> import requests
 >>> state = requests.get('http://localhost:5001/state/game').json()
@@ -27,6 +28,8 @@ The server will launch automatically when you start the game.
 
 ## Full documentation
 
-See `Documentation.md` for full reference and additional examples.
+Refer to `Documentation.md` for a full reference with additional examples.
+
+---
 
 [![Requires BTD6 Mod Helper](https://raw.githubusercontent.com/gurrenm3/BTD-Mod-Helper/master/banner.png)](https://github.com/gurrenm3/BTD-Mod-Helper#readme)
