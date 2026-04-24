@@ -19,7 +19,7 @@ The server will launch automatically when you start the game.
 Python:
 ```python
 >>> import requests
->>> state = requests.get('http://localhost:5001/state/game').json()
+>>> state = requests.get('http://localhost:5001/match').json()
 >>> state['round']
 62
 >>> requests.post('http://localhost:5001/action', json={'type': 'startRound'}).json()

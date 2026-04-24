@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using BTD_Mod_Helper;
 using BTD_Mod_Helper.Api.Helpers;
 using BTD_Mod_Helper.Extensions;
@@ -18,8 +20,12 @@ using Il2CppAssets.Scripts.Simulation.Towers;
 using Il2CppAssets.Scripts.Unity.Bridge;
 using Il2CppAssets.Scripts.Simulation.Bloons;
 using BTD_Mod_Helper.Api.ModOptions;
+using Il2CppAssets.Scripts.Utils;
+using Il2CppAssets.Scripts.Unity;
+using Il2CppAssets.Scripts.Unity.Player;
+using Il2CppAssets.Scripts.Unity.Map;
 
-[assembly: MelonInfo(typeof(BTD6API.Main), "BTD6 HTTP API", "1.0.0", "Askryne")]
+[assembly: MelonInfo(typeof(BTD6API.Main), "BTD6 HTTP API", "2.0.0", "Askryne")]
 [assembly: MelonGame("Ninja Kiwi", "BloonsTD6")]
 
 namespace BTD6API
@@ -36,10 +42,36 @@ namespace BTD6API
 
         private HttpListener _listener;
         private Thread _thread;
+        private CancellationTokenSource _sseDispatcherCts;
         private static readonly List<(HttpListenerResponse res, CancellationTokenSource cts)> _sseClients = new();
         private static readonly object _sseLock = new object();
+        private static readonly ConcurrentQueue<(string type, string data)> _sseEventQueue =
+            new ConcurrentQueue<(string, string)>();
         private volatile bool _roundIsRunning = false;
-        private volatile bool _pendingRestart = false;
+        private static readonly Dictionary<(int towerId, string abilityName), bool> _abilityReadyStates = new();
+
+        private class MainThreadWork
+        {
+            public readonly Func<string> Execute;
+            public readonly TaskCompletionSource<string> Tcs = new TaskCompletionSource<string>();
+            public readonly DateTime Deadline;
+            public MainThreadWork(Func<string> execute)
+            {
+                Execute = execute;
+                Deadline = DateTime.UtcNow.AddSeconds(11);
+            }
+        }
+        private static readonly ConcurrentQueue<MainThreadWork> _mainThreadQueue =
+            new ConcurrentQueue<MainThreadWork>();
+
+        private static string RunOnMainThread(Func<string> work)
+        {
+            var item = new MainThreadWork(work);
+            _mainThreadQueue.Enqueue(item);
+            if (!item.Tcs.Task.Wait(TimeSpan.FromSeconds(10)))
+                return JsonConvert.SerializeObject(new { error = "timed out waiting for main thread" });
+            return item.Tcs.Task.Result;
+        }
 
         public override void OnApplicationStart()
         {
@@ -50,26 +82,33 @@ namespace BTD6API
         private void Serve()
         {
             _listener?.Stop();
+            _sseDispatcherCts?.Cancel();
 
             int port = ServerPort;
             _listener = new HttpListener();
             _listener.Prefixes.Add($"http://localhost:{port}/");
             _listener.Start();
-            _thread = new Thread(Listen) { IsBackground = true };
+
+            var listener = _listener;
+            _thread = new Thread(() => Listen(listener)) { IsBackground = true };
             _thread.Start();
-            Console.WriteLine($"[BTD6 API] Listening on http://localhost:{port}/");
+
+            _sseDispatcherCts = new CancellationTokenSource();
+            var token = _sseDispatcherCts.Token;
+            new Thread(() => SseDispatcher(token)) { IsBackground = true }.Start();
+
+            MelonLogger.Msg($"Listening on http://localhost:{port}/");
         }
 
-        private void Listen()
+        private void Listen(HttpListener listener)
         {
-            while (_listener.IsListening)
+            while (listener.IsListening)
             {
                 try
                 {
-                    var ctx = _listener.GetContext();
+                    var ctx = listener.GetContext();
                     if (ctx.Request.Url.AbsolutePath == "/events")
                     {
-                        // Dedicated thread for SSE:
                         new Thread(() => Handle(ctx)) { IsBackground = true }.Start();
                     }
                     else
@@ -77,90 +116,131 @@ namespace BTD6API
                         ThreadPool.QueueUserWorkItem(_ => Handle(ctx));
                     }
                 }
-                catch { /* _listener stopped. */ }
+                catch { /* Listener stopped. */ }
             }
         }
 
         private void Handle(HttpListenerContext ctx)
         {
-            var req = ctx.Request;
             var res = ctx.Response;
-            res.ContentType = "application/json";
-            res.Headers.Add("Access-Control-Allow-Origin", "*");
-            var path = req.Url.AbsolutePath;
-
-            string body;
-            if (path == "/state/game" && req.HttpMethod == "GET")
+            try
             {
-                body = GetStateJson();
+                var req = ctx.Request;
+                res.ContentType = "application/json";
+                res.Headers.Add("Access-Control-Allow-Origin", "*");
+                var path = req.Url.AbsolutePath;
+
+                if (path == "/events" && req.HttpMethod == "GET")
+                {
+                    res.ContentType = "text/event-stream";
+                    res.Headers.Add("Cache-Control", "no-cache");
+                    res.Headers.Add("X-Accel-Buffering", "no");
+                    res.SendChunked = true;
+
+                    var cts = new CancellationTokenSource();
+
+                    lock (_sseLock)
+                        _sseClients.Add((res, cts));
+
+                    cts.Token.WaitHandle.WaitOne();
+
+                    lock (_sseLock)
+                        _sseClients.RemoveAll(c => c.cts == cts);
+
+                    try { res.Abort(); } catch { }
+                    return;
+                }
+
+                string body;
+                if (path == "/match" && req.HttpMethod == "GET")
+                {
+                    body = RunOnMainThread(GetMatchStateJson);
+                }
+                else if (path == "/player" && req.HttpMethod == "GET")
+                {
+                    body = RunOnMainThread(GetPlayerJson);
+                }
+                else if (path == "/action" && req.HttpMethod == "POST")
+                {
+                    var json = new StreamReader(req.InputStream).ReadToEnd();
+                    body = RunOnMainThread(() => HandleAction(json));
+                }
+                else if (path == "/health" && req.HttpMethod == "GET")
+                {
+                    body = JsonConvert.SerializeObject(new { ok = true });
+                }
+                else
+                {
+                    res.StatusCode = 404;
+                    body = JsonConvert.SerializeObject(new { error = "not found" });
+                }
+
+                res.KeepAlive = false;
+                var bytes = Encoding.UTF8.GetBytes(body);
+                try
+                {
+                    res.ContentLength64 = bytes.Length;
+                    res.OutputStream.Write(bytes, 0, bytes.Length);
+                    res.Close();
+                }
+                catch
+                {
+                    try { res.Abort(); } catch { }
+                }
             }
-            else if (path == "/action" && req.HttpMethod == "POST")
+            catch
             {
-                var reader = new StreamReader(req.InputStream);
-                var json = reader.ReadToEnd();
-                body = HandleAction(json);
+                try { res.Abort(); } catch { }
             }
-            else if (path == "/events" && req.HttpMethod == "GET")
-            {
-                res.ContentType = "text/event-stream";
-                res.Headers.Add("Cache-Control", "no-cache");
-                res.Headers.Add("X-Accel-Buffering", "no");
-                res.SendChunked = true;
-
-                var cts = new CancellationTokenSource();
-
-                lock (_sseLock)
-                    _sseClients.Add((res, cts));
-
-                cts.Token.WaitHandle.WaitOne();
-
-                lock (_sseLock)
-                    _sseClients.RemoveAll(c => c.cts == cts);
-
-                return;
-            }
-            else
-            {
-                res.StatusCode = 404;
-                body = JsonConvert.SerializeObject(new { error = "not found" });
-            }
-
-            var bytes = Encoding.UTF8.GetBytes(body);
-            res.ContentLength64 = bytes.Length;
-            res.OutputStream.Write(bytes, 0, bytes.Length);
-            res.OutputStream.Close();
         }
 
         public static void BroadcastEvent(string eventType, string data = "{}")
         {
-            string sseMessage = $"event: {eventType}\ndata: {data}\n\n";
-            byte[] bytes = Encoding.UTF8.GetBytes(sseMessage);
+            _sseEventQueue.Enqueue((eventType, data));
+        }
 
-            lock (_sseLock)
+        private static void SseDispatcher(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var dead = new List<(HttpListenerResponse, CancellationTokenSource)>();
-                foreach (var (client, cts) in _sseClients)
+                if (!_sseEventQueue.TryDequeue(out var ev))
                 {
-                    try
-                    {
-                        client.OutputStream.Write(bytes, 0, bytes.Length);
-                        client.OutputStream.Flush();
-                    }
-                    catch
-                    {
-                        cts.Cancel();
-                        dead.Add((client, cts));
-                    }
+                    Thread.Sleep(1);
+                    continue;
                 }
-                foreach (var d in dead)
-                    _sseClients.Remove(d);
+
+                byte[] bytes = Encoding.UTF8.GetBytes($"event: {ev.type}\ndata: {ev.data}\n\n");
+
+                List<(HttpListenerResponse, CancellationTokenSource)> snapshot;
+                lock (_sseLock)
+                    snapshot = _sseClients.ToList();
+
+                var dead = new List<(HttpListenerResponse, CancellationTokenSource)>();
+                foreach (var (client, cts) in snapshot)
+                {
+                    var t = Task.Run(() => { client.OutputStream.Write(bytes, 0, bytes.Length); client.OutputStream.Flush(); }, cancellationToken);
+                    bool ok;
+                    try { ok = t.Wait(TimeSpan.FromSeconds(3)) && !t.IsFaulted; }
+                    catch { ok = false; }
+                    if (!ok) { cts.Cancel(); dead.Add((client, cts)); }
+                }
+
+                if (dead.Count > 0)
+                    lock (_sseLock)
+                        foreach (var d in dead) _sseClients.Remove(d);
             }
         }
 
         public override void OnMatchStart()
         {
+            _abilityReadyStates.Clear();
             BroadcastEvent("matchStart");
             base.OnMatchStart();
+        }
+        public override void OnMainMenu()
+        {
+            BroadcastEvent("mainMenu");
+            base.OnMainMenu();
         }
         public override void OnRoundStart()
         {
@@ -181,6 +261,15 @@ namespace BTD6API
         {
             BroadcastEvent("defeat");
             base.OnDefeat();
+        }
+        [HarmonyPatch(typeof(Btd6Player), nameof(Btd6Player.RankUp))]
+        public class RankUpPatch
+        {
+            [HarmonyPostfix]
+            public static void Postfix()
+            {
+                BroadcastEvent("rankUp");
+            }
         }
         [HarmonyPatch(typeof(UnityToSimulation), nameof(UnityToSimulation.Restart))]
         public class RestartPatch
@@ -206,7 +295,7 @@ namespace BTD6API
             [HarmonyPostfix]
             public static void Postfix(Tower __instance)
             {
-                if (__instance.model.name.Contains(InGame.instance.SelectedHero))
+                if (InGame.instance != null && __instance.model.name.Contains(InGame.instance.SelectedHero))
                 {
                     BroadcastEvent("heroLeveledUp", JsonConvert.SerializeObject(new { id = __instance.Id.Id }));
                 }
@@ -260,27 +349,59 @@ namespace BTD6API
             [HarmonyPostfix]
             public static void Postfix(Dictionary<string, string> __state)
             {
-                var dmg = (int)(double.Parse(__state["health"]) - InGame.instance.GetHealth());
+                if (InGame.instance == null) return;
+                var dmg = double.Parse(__state["health"]) - InGame.instance.GetHealth();
                 BroadcastEvent("bloonLeak", JsonConvert.SerializeObject(new { type = __state["type"], damage = dmg }));
             }
         }
 
         public override void OnUpdate()
         {
-            if (_pendingRestart)
+            while (_mainThreadQueue.TryDequeue(out var item))
             {
-                _pendingRestart = false;
-                InGame.instance.bridge.Restart();
+                // Skip items that already timed out on the HTTP side:
+                if (DateTime.UtcNow > item.Deadline)
+                {
+                    item.Tcs.TrySetResult(JsonConvert.SerializeObject(new { error = "timed out waiting for main thread" }));
+                    continue;
+                }
+                string result;
+                try { result = item.Execute(); }
+                catch (Exception e) { result = JsonConvert.SerializeObject(new { error = e.Message }); }
+                item.Tcs.TrySetResult(result);
             }
+
+            var inGame = InGame.instance;
+            if (inGame?.bridge != null)
+            {
+                foreach (var ability in inGame.bridge.GetAllAbilities(false).ToArray())
+                {
+                    var key = (ability.tower.Id, ability.model.displayName);
+                    bool isNowReady = ability.IsReady;
+
+                    if (_abilityReadyStates.TryGetValue(key, out bool wasReady)
+                        && isNowReady && !wasReady)
+                    {
+                        BroadcastEvent("abilityReady", JsonConvert.SerializeObject(new
+                        {
+                            towerId = ability.tower.Id,
+                            abilityName = ability.model.displayName
+                        }));
+                    }
+
+                    _abilityReadyStates[key] = isNowReady;
+                }
+            }
+
             base.OnUpdate();
         }
 
-        private string GetStateJson()
+        private string GetMatchStateJson()
         {
             try
             {
                 var inGame = InGame.instance;
-                if (inGame == null) return JsonConvert.SerializeObject(new { status = "notInGame" });
+                if (inGame == null) return JsonConvert.SerializeObject(new { status = "notInMatch" });
                 var sim = inGame.GetSimulation();
 
                 // Meta:
@@ -334,7 +455,7 @@ namespace BTD6API
                         type = model?.name ?? "unknown",
                         upgrades = model?.tiers,
                         pos = new { x = tower.Position.X, y = tower.Position.Y },
-                        createdOnRound = tower.createdOnRound - 1,
+                        roundPlaced = tower.createdOnRound - 1,
                         sellValue = tower.SaleValue,
                         cashEarned = tower?.cashEarned ?? 0,
                         livesGained = tower?.livesGained ?? 0,
@@ -350,10 +471,14 @@ namespace BTD6API
                     });
                 }
                 var selectedHero = inGame.SelectedHero;
+                var availableTowers = Helpers.ValidBaseTowerNames().ToList().Where(t =>
+                    inGame.GetTowerInventory().HasInventory(inGame.GetGameModel().GetTowerModel(t))
+                    && GameExt.GetBtd6Player(Game.instance).HasUnlockedTower(t)
+                );
 
                 return JsonConvert.SerializeObject(new
                 {
-                    status = "inGame",
+                    status = "inMatch",
                     map,
                     difficulty,
                     gameMode,
@@ -369,7 +494,8 @@ namespace BTD6API
                     endRound,
                     roundIsRunning = _roundIsRunning,
                     towers,
-                    selectedHero
+                    selectedHero,
+                    availableTowers
                 });
             }
             catch (Exception e)
@@ -378,13 +504,35 @@ namespace BTD6API
             }
         }
 
-        private string HandleAction(string json)
+        private static string GetPlayerJson()
+        {
+            var btd6Player = GameExt.GetBtd6Player(Game.instance);
+            var playerProfile = GameExt.GetPlayerProfile(Game.instance);
+
+            var acquiredKnowledge = new List<string>();
+            foreach (var mk in playerProfile.acquiredKnowledge)
+                acquiredKnowledge.Add(mk);
+
+            return JsonConvert.SerializeObject(new
+            {
+                rank = playerProfile.rank.ValueInt,
+                veteranRank = playerProfile.veteranRank.ValueInt,
+                monkeyMoney = btd6Player.GetMonkeyMoney(),
+                knowledgePoints = playerProfile.KnowledgePoints,
+                acquiredKnowledge,
+                isKnowledgeEnabled = !playerProfile.knowledgeDisabled
+            });
+        }
+
+        private static string HandleAction(string json)
         {
             try
             {
                 dynamic action = JsonConvert.DeserializeObject(json) ?? new { };
                 string type = action?.type ?? "";
                 var inGame = InGame.instance;
+                if (inGame == null)
+                    return JsonConvert.SerializeObject(new { error = "not in match" });
                 var sim = inGame.GetUnityToSimulation();
 
                 switch (type)
@@ -392,80 +540,84 @@ namespace BTD6API
                     // Time:
                     case "setFastForward":
                         sim.SetFastForward((bool)action.enabled);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "setFastForwardSpeed":
                         TimeHelper.OverrideFastForwardTimeScale = (double)action.speed;
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "setAutostart":
                         sim.SetAutoPlay((bool)action.enabled);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "setPaused":
                         TimeManager.gamePaused = (bool)action.paused;
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
 
                     // Game flow:
                     case "startRound":
                         sim.StartRound();
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "setRound":
                         sim.SetRound((int)action.round);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "restart":
-                        // We'll crash if we try to restart from a thread,
-                        // so set restart to true and OnUpdate will handle it next tick.
-                        _pendingRestart = true;
-                        return "{\"ok\":true}";
+                        inGame.bridge.Restart();
+                        return JsonConvert.SerializeObject(new { ok = true });
 
                     // Economy:
                     case "setCash":
                         inGame.SetCash((double)action.value);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "addCash":
                         inGame.AddCash((double)action.value);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "setLives":
                         inGame.SetHealth((double)action.value);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "addLives":
                         inGame.AddHealth((double)action.value);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
 
                     // Towers:
                     case "placeTower":
+                        var allModels = InGame.instance.GetGameModel().GetTowerModels((string)action.towerId);
+                        var model = allModels.FirstOrDefault(m => m.name == (string)action.towerId);
+                        // GetTowerModel doesn't always find the right model,
+                        // so we use GetTowerModels with FirstOrDefault.
+                        if (model == null)
+                            return JsonConvert.SerializeObject(new { error = "tower not found" });
                         sim.CreateTowerAt(
                             new UnityEngine.Vector2((float)action.x, (float)action.y),
-                            inGame.GetGameModel().GetTowerModel((string)action.towerId),
+                            model,
                             ObjectId.FromData(0),
                             (bool)action.free,
                             null
                         );
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "upgradeTower":
                         sim.UpgradeTower(ObjectId.FromData((uint)action.id), (int)action.path, 0d, null);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "sellTower":
                         sim.SellTower(ObjectId.FromData((uint)action.id));
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "changeTargetPriority":
                         sim.SetNextTowerTargetType(ObjectId.FromData((uint)action.id), (bool)action.prev);
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "activateAbility":
                         var targetAbility = inGame.bridge.GetAllAbilities(false).ToArray()
                             .FirstOrDefault(ab =>
                                 ab.tower == sim.GetTower(ObjectId.FromData((uint)action.id)).Id &&
-                                ab.model.displayName == (string)action.name);
+                                ab.model.displayName == (string)action.abilityName);
                         if (targetAbility == null)
                             return JsonConvert.SerializeObject(new { error = "ability not found" });
                         targetAbility.Activate();
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
                     case "activateAllAbilities":
                         var abilities = inGame.bridge.GetAllAbilities(false).ToList();
                         foreach (var ab in abilities)
                             ab.Activate();
-                        return "{\"ok\":true}";
+                        return JsonConvert.SerializeObject(new { ok = true });
 
                     default:
-                        return $"{{\"error\":\"unknown action: {type}\"}}";
+                        return JsonConvert.SerializeObject(new { error = $"unknown action: {type}" });
                 }
             }
             catch (Exception e)
@@ -476,6 +628,7 @@ namespace BTD6API
 
         public override void OnApplicationQuit()
         {
+            _sseDispatcherCts?.Cancel();
             _listener?.Stop();
         }
     }
