@@ -479,7 +479,7 @@ namespace BTD6API
             var inGame = InGame.instance;
             if (inGame?.bridge != null)
             {
-                foreach (var ability in inGame.bridge.GetAllAbilities(false).ToArray())
+                foreach (var ability in inGame.bridge.GetAllAbilities(inGame.bridge.GetInputId(), false).ToArray())
                 {
                     var key = (ability.tower.Id, ability.model.displayName);
                     bool isNowReady = ability.IsReady;
@@ -554,7 +554,7 @@ namespace BTD6API
 
                 // Towers:
                 var towers = new List<object>();
-                var allAbilities = inGame.bridge.GetAllAbilities(false).ToArray();
+                var allAbilities = inGame.bridge.GetAllAbilities(inGame.bridge.GetInputId(), false).ToArray();
                 foreach (var tower in inGame.GetTowers())
                 {
                     var model = tower.towerModel;
@@ -709,7 +709,7 @@ namespace BTD6API
             return bridge.CanPlaceTowerAt(
                 new UnityEngine.Vector2(x, y),
                 towerModel,
-                bridge.MyPlayerNumber,
+                bridge.GetInputId(),
                 ObjectId.FromData(0)
             );
         }
@@ -893,21 +893,35 @@ namespace BTD6API
                             if (model == null)
                                 return JsonConvert.SerializeObject(new { error = "tower not found" });
                             bridge.CreateTowerAt(
+                                bridge.GetInputId(),
                                 new UnityEngine.Vector2((float)action.x, (float)action.y),
                                 model,
                                 ObjectId.FromData(0),
                                 (bool)action.free,
-                                null
+                                new Action<bool>(success => { })
                             );
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "upgradeTower":
-                            bridge.UpgradeTower(ObjectId.FromData((uint)action.id), (int)action.path, 0d, null);
+                            bridge.UpgradeTower(
+                                bridge.GetInputId(),
+                                ObjectId.FromData((uint)action.id),
+                                (int)action.path,
+                                0d,
+                                new Action<bool>(success => { })
+                            );
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "sellTower":
-                            bridge.SellTower(ObjectId.FromData((uint)action.id));
+                            bridge.SellTower(
+                                bridge.GetInputId(),
+                                ObjectId.FromData((uint)action.id)
+                            );
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "changeTargetPriority":
-                            bridge.SetNextTowerTargetType(ObjectId.FromData((uint)action.id), (bool)action.prev);
+                            bridge.SetNextTowerTargetType(
+                                bridge.GetInputId(),
+                                ObjectId.FromData((uint)action.id),
+                                (bool)action.prev
+                            );
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "setTargetPriority":
                             var tower = bridge.GetTower(ObjectId.FromData((uint)action.id))?.GetTower();
@@ -923,18 +937,18 @@ namespace BTD6API
                                 return JsonConvert.SerializeObject(new { error = "tower not found" });
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "activateAbility":
-                            var targetAbility = inGame.bridge.GetAllAbilities(false).ToArray()
+                            var targetAbility = inGame.bridge.GetAllAbilities(inGame.bridge.GetInputId(), false).ToArray()
                                 .FirstOrDefault(ab =>
                                     ab.tower == bridge.GetTower(ObjectId.FromData((uint)action.id)).Id &&
                                     ab.model.displayName == (string)action.abilityName);
                             if (targetAbility == null)
                                 return JsonConvert.SerializeObject(new { error = "ability not found" });
-                            targetAbility.Activate();
+                            targetAbility.Activate(bridge.GetInputId());
                             return JsonConvert.SerializeObject(new { ok = true });
                         case "activateAllAbilities":
-                            var abilities = inGame.bridge.GetAllAbilities(false).ToList();
+                            var abilities = inGame.bridge.GetAllAbilities(inGame.bridge.GetInputId(), false).ToList();
                             foreach (var ab in abilities.Where(a => !a.IsPassive && a.IsReady))
-                                ab.Activate();
+                                ab.Activate(bridge.GetInputId());
                             return JsonConvert.SerializeObject(new { ok = true });
                     }
                 }
